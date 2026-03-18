@@ -1,0 +1,55 @@
+name: Scrape Datanomics Amazon
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */4 * * *"
+
+jobs:
+  scrape-amazon:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - datanomics/configs/apple.json
+          - datanomics/configs/samsung.json
+          - datanomics/configs/xiaomi.json
+          - datanomics/configs/huawei.json
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Google Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install ChromeDriver
+        uses: nanasess/setup-chromedriver@v2
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r datanomics/requirements.txt
+
+      - name: Verify Chrome and ChromeDriver
+        run: |
+          google-chrome --version
+          chromedriver --version
+
+      - name: Run scraper
+        run: |
+          python datanomics/src/run.py --config "${{ matrix.config }}"
+
+      - name: Commit updated outputs and state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add datanomics/outputs/amazon_offers.csv datanomics/state/*.json || true
+          git diff --cached --quiet || git commit -m "Update Amazon tracker from ${{ matrix.config }}"
+          git push
