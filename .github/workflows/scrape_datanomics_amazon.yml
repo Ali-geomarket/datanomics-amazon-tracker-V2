@@ -8,18 +8,12 @@ on:
 jobs:
   scrape-amazon:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          - datanomics/configs/apple.json
-          - datanomics/configs/samsung.json
-          - datanomics/configs/xiaomi.json
-          - datanomics/configs/huawei.json
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,14 +36,29 @@ jobs:
           google-chrome --version
           chromedriver --version
 
-      - name: Run scraper
+      - name: Ensure output file exists
         run: |
-          python datanomics/src/run.py --config "${{ matrix.config }}"
+          mkdir -p datanomics/outputs
+          mkdir -p datanomics/state
+          touch datanomics/outputs/amazon_offers.csv
+
+      - name: Run scraper for Apple
+        run: python datanomics/src/run.py --config datanomics/configs/apple.json
+
+      - name: Run scraper for Samsung
+        run: python datanomics/src/run.py --config datanomics/configs/samsung.json
+
+      - name: Run scraper for Xiaomi
+        run: python datanomics/src/run.py --config datanomics/configs/xiaomi.json
+
+      - name: Run scraper for Huawei
+        run: python datanomics/src/run.py --config datanomics/configs/huawei.json
 
       - name: Commit updated outputs and state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add datanomics/outputs/amazon_offers.csv datanomics/state/*.json || true
-          git diff --cached --quiet || git commit -m "Update Amazon tracker from ${{ matrix.config }}"
+          git add datanomics/outputs/amazon_offers.csv
+          git add datanomics/state/*.json || true
+          git diff --cached --quiet || git commit -m "Update Amazon tracker"
           git push
