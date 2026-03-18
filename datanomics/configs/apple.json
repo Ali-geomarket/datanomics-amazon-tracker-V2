@@ -1,0 +1,12 @@
+{
+  "brand": "Apple",
+  "output_csv": "datanomics/outputs/amazon_offers.csv",
+  "state_file": "datanomics/state/apple_state.json",
+  "products": [
+    {
+      "asin": "B0DGHY5KG8",
+      "product_name": "Apple iPhone 16 128 Go",
+      "product_url": "https://www.amazon.fr/dp/B0DGHY5KG8"
+    }
+  ]
+}
