@@ -60,5 +60,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add datanomics/outputs/amazon_offers.csv
           git add datanomics/state/*.json || true
+          git add datanomics/debug/* || true
           git diff --cached --quiet || git commit -m "Update Amazon tracker"
           git push
