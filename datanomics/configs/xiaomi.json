@@ -1,0 +1,12 @@
+{
+  "brand": "Xiaomi",
+  "output_csv": "datanomics/outputs/amazon_offers.csv",
+  "state_file": "datanomics/state/xiaomi_state.json",
+  "products": [
+    {
+      "asin": "B0DRBWS1KW",
+      "product_name": "Xiaomi Redmi Note Pro",
+      "product_url": "https://www.amazon.fr/dp/B0DRBWS1KW"
+    }
+  ]
+}
