@@ -1,20 +1,16 @@
 import argparse
-import csv
 import json
 import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import pandas as pd
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
 
 USER_AGENT = (
@@ -22,9 +18,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
-CSV_COLUMNS = [
-    "scrape_timestamp_utc",
-    "batch_id",
+TRACKER_KEY_COLUMNS = [
     "brand",
     "asin",
     "product_name",
@@ -32,13 +26,11 @@ CSV_COLUMNS = [
     "offers_url",
     "seller_name",
     "offer_condition",
-    "price_item_eur",
-    "shipping_eur",
-    "price_total_eur",
-    "is_free_shipping",
-    "is_main_offer",
-    "offer_rank",
-    "scrape_status",
+]
+
+BASE_COLUMNS = TRACKER_KEY_COLUMNS + [
+    "last_seen_utc",
+    "last_scrape_status",
 ]
 
 
@@ -57,26 +49,10 @@ def load_state(path: str) -> Dict:
     if os.path.exists(path):
         return load_json(path)
     return {
-        "last_batch_id": -1,
         "last_run_utc": None,
         "last_status": None,
         "run_count": 0,
     }
-
-
-def append_rows_to_csv(csv_path: str, rows: List[Dict]) -> None:
-    if not rows:
-        return
-
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    file_exists = os.path.exists(csv_path)
-
-    with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        if not file_exists:
-            writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
 
 
 def build_driver(headless: bool = True) -> webdriver.Chrome:
@@ -86,33 +62,13 @@ def build_driver(headless: bool = True) -> webdriver.Chrome:
 
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--window-size=1600,2200")
+    chrome_options.add_argument("--window-size=1600,2600")
     chrome_options.add_argument("--lang=fr-FR")
     chrome_options.add_argument(f"--user-agent={USER_AGENT}")
 
     driver = webdriver.Chrome(options=chrome_options)
     driver.set_page_load_timeout(60)
     return driver
-
-
-def accept_or_reject_cookies(driver: webdriver.Chrome) -> None:
-    possible_selectors = [
-        (By.ID, "sp-cc-rejectall-link"),
-        (By.ID, "sp-cc-accept"),
-        (By.XPATH, "//input[@name='accept']"),
-        (By.XPATH, "//span[contains(text(), 'Refuser') or contains(text(), 'Accepter')]"),
-    ]
-
-    for by, value in possible_selectors:
-        try:
-            btn = WebDriverWait(driver, 4).until(
-                EC.element_to_be_clickable((by, value))
-            )
-            driver.execute_script("arguments[0].click();", btn)
-            time.sleep(1)
-            return
-        except Exception:
-            continue
 
 
 def clean_text(text: Optional[str]) -> str:
@@ -147,17 +103,26 @@ def extract_asin_from_url(url: str) -> Optional[str]:
     return None
 
 
-def safe_find_text(parent, by: By, value: str) -> str:
-    try:
-        return clean_text(parent.find_element(by, value).text)
-    except Exception:
-        return ""
+def accept_or_reject_cookies(driver: webdriver.Chrome) -> None:
+    selectors = [
+        (By.ID, "sp-cc-rejectall-link"),
+        (By.ID, "sp-cc-accept"),
+    ]
+    for by, value in selectors:
+        try:
+            btn = driver.find_element(by, value)
+            driver.execute_script("arguments[0].click();", btn)
+            time.sleep(1)
+            return
+        except Exception:
+            continue
 
 
 def infer_shipping_cost(shipping_text: str) -> Optional[float]:
     txt = shipping_text.lower()
     if not txt:
         return None
+
     if "gratuite" in txt or "gratuit" in txt or "free" in txt:
         return 0.0
 
@@ -169,8 +134,7 @@ def infer_shipping_cost(shipping_text: str) -> Optional[float]:
 
 
 def is_new_offer(condition_text: str) -> bool:
-    txt = condition_text.lower()
-    return "neuf" in txt
+    return "neuf" in condition_text.lower()
 
 
 def is_excluded_seller(seller_name: str) -> bool:
@@ -178,226 +142,147 @@ def is_excluded_seller(seller_name: str) -> bool:
     return txt == "amazon seconde main"
 
 
-def get_product_title(driver: webdriver.Chrome) -> str:
-    selectors = [
-        (By.ID, "productTitle"),
-        (By.CSS_SELECTOR, "h1 span"),
-        (By.CSS_SELECTOR, "span#title"),
-    ]
-    for by, value in selectors:
-        try:
-            text = clean_text(driver.find_element(by, value).text)
-            if text:
-                return text
-        except Exception:
-            continue
-    return ""
+def now_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def scrape_main_offer(
-    driver: webdriver.Chrome,
-    brand: str,
-    asin: str,
-    product_name: str,
-    product_url: str,
-    scrape_ts: str,
-    batch_id: int,
-) -> List[Dict]:
-    rows = []
+def current_scrape_column_name() -> str:
+    # colonne horaire arrondie à l'heure pour le tracker
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:00")
 
-    driver.get(product_url)
-    time.sleep(3)
 
-    page_title = get_product_title(driver)
-    if page_title:
-        product_name = page_title
-
-    price_item = None
-    shipping_cost = None
-    seller_name = ""
-    condition_text = "Neuf"
-
-    price_candidates = [
-        (By.CSS_SELECTOR, "span.a-price span.a-offscreen"),
-        (By.CSS_SELECTOR, "#corePrice_feature_div span.a-offscreen"),
-        (By.CSS_SELECTOR, "#tp_price_block_total_price_ww span.a-offscreen"),
-    ]
-    for by, value in price_candidates:
-        try:
-            elem_text = clean_text(driver.find_element(by, value).text)
-            price_item = parse_price_to_float(elem_text)
-            if price_item is not None:
-                break
-        except Exception:
-            continue
-
-    shipping_candidates = [
-        (By.CSS_SELECTOR, "[data-csa-c-delivery-price]"),
-        (By.ID, "deliveryBlockMessage"),
-        (By.ID, "mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE"),
-    ]
-    shipping_text = ""
-    for by, value in shipping_candidates:
-        try:
-            elem = driver.find_element(by, value)
-            shipping_text = clean_text(
-                elem.get_attribute("data-csa-c-delivery-price") or elem.text
-            )
-            if shipping_text:
-                shipping_cost = infer_shipping_cost(shipping_text)
-                break
-        except Exception:
-            continue
-
-    seller_candidates = [
-        (By.ID, "sellerProfileTriggerId"),
-        (By.CSS_SELECTOR, "#merchantInfo a"),
-        (By.CSS_SELECTOR, "a#sellerProfileTriggerId"),
-    ]
-    for by, value in seller_candidates:
-        try:
-            seller_name = clean_text(driver.find_element(by, value).text)
-            if seller_name:
-                break
-        except Exception:
-            continue
-
-    if not seller_name:
-        merchant_text = safe_find_text(driver, By.ID, "merchantInfo")
-        if merchant_text:
-            seller_name = merchant_text
-
-    if price_item is not None and seller_name and not is_excluded_seller(seller_name):
-        total_price = price_item + (shipping_cost or 0.0)
-        rows.append(
-            {
-                "scrape_timestamp_utc": scrape_ts,
-                "batch_id": batch_id,
-                "brand": brand,
-                "asin": asin,
-                "product_name": product_name,
-                "product_url": product_url,
-                "offers_url": f"https://www.amazon.fr/gp/offer-listing/{asin}",
-                "seller_name": seller_name,
-                "offer_condition": condition_text,
-                "price_item_eur": price_item,
-                "shipping_eur": shipping_cost if shipping_cost is not None else "",
-                "price_total_eur": total_price,
-                "is_free_shipping": 1 if shipping_cost == 0 else 0,
-                "is_main_offer": 1,
-                "offer_rank": 0,
-                "scrape_status": "ok",
-            }
+def scroll_page(driver: webdriver.Chrome) -> None:
+    positions = [0.2, 0.45, 0.7, 1.0]
+    for p in positions:
+        driver.execute_script(
+            "window.scrollTo(0, document.body.scrollHeight * arguments[0]);", p
         )
-
-    return rows
-
-
-def extract_offer_blocks(driver: webdriver.Chrome):
-    time.sleep(3)
-
-    # petit scroll pour forcer le rendu complet
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.35);")
-    time.sleep(2)
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.65);")
-    time.sleep(2)
+        time.sleep(1.5)
     driver.execute_script("window.scrollTo(0, 0);")
     time.sleep(1)
 
-    selectors = [
-        "div[id^='aod-offer-']",
-        "div.aod-information-block",
-        "div.a-section.a-spacing-none.a-padding-base",
-        "div[data-cy='offer']",
-        "div.olpOffer",
+
+def find_offer_containers(driver: webdriver.Chrome):
+    """
+    On cherche des conteneurs d'offres avec plusieurs stratégies.
+    L'idée est d'éviter les sélecteurs trop fragiles.
+    """
+    candidates = []
+
+    xpaths = [
+        # blocs Amazon AOD typiques
+        "//div[starts-with(@id, 'aod-offer-')]",
+        # blocs contenant explicitement Vendeur et Expéditeur
+        "//div[contains(., 'Vendeur') and contains(., 'Expéditeur')]",
+        # fallback générique si la structure change
+        "//div[contains(., 'Vendeur') and contains(., 'Neuf')]",
     ]
 
-    for css in selectors:
-        blocks = driver.find_elements(By.CSS_SELECTOR, css)
-        if blocks:
-            print(f"[DEBUG] selector '{css}' -> {len(blocks)} blocks found")
-            return blocks
-
-    print("[DEBUG] No offer blocks found with known selectors")
-    return []
-
-
-def extract_offer_condition(block) -> str:
-    candidates = [
-        (By.CSS_SELECTOR, "div#aod-offer-heading"),
-        (By.CSS_SELECTOR, "div[id*='aod-offer-heading']"),
-        (By.CSS_SELECTOR, "h5"),
-        (By.CSS_SELECTOR, "span"),
-    ]
-
-    for by, value in candidates:
+    for xp in xpaths:
         try:
-            elems = block.find_elements(by, value)
-            for elem in elems:
-                text = clean_text(elem.text)
-                if text and ("neuf" in text.lower() or "occasion" in text.lower() or "reconditionné" in text.lower()):
-                    return text
+            elems = driver.find_elements(By.XPATH, xp)
+            if elems:
+                print(f"[DEBUG] XPath '{xp}' -> {len(elems)} blocs")
+                candidates = elems
+                break
         except Exception:
             continue
-    return ""
 
-def extract_offer_price(block) -> Optional[float]:
-    candidates = [
-        (By.CSS_SELECTOR, "span.a-price span.a-offscreen"),
-        (By.CSS_SELECTOR, ".a-price .a-offscreen"),
-        (By.CSS_SELECTOR, "span.a-price"),
-    ]
-    for by, value in candidates:
+    # dédoublonnage simple par texte
+    unique = []
+    seen = set()
+    for elem in candidates:
         try:
-            text = clean_text(block.find_element(by, value).text)
-            value_num = parse_price_to_float(text)
-            if value_num is not None:
-                return value_num
+            txt = clean_text(elem.text)
+            if not txt:
+                continue
+            key = txt[:400]
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(elem)
         except Exception:
             continue
+
+    print(f"[DEBUG] Blocs d'offres retenus après dédoublonnage : {len(unique)}")
+    return unique
+
+
+def extract_price_from_text(block_text: str) -> Optional[float]:
+    # prix principal sur une ligne de type 26300€ ou 263,00 €
+    patterns = [
+        r"(\d[\d\s.,]{0,12})\s*€",
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, block_text)
+        if matches:
+            for m in matches:
+                value = parse_price_to_float(m)
+                if value is not None and value > 0:
+                    return value
     return None
 
 
-def extract_offer_shipping(block) -> (Optional[float], str):
-    texts = []
-
-    selectors = [
-        (By.CSS_SELECTOR, "[data-csa-c-delivery-price]"),
-        (By.CSS_SELECTOR, "div[id*='DELIVERY_BLOCK']"),
-        (By.CSS_SELECTOR, "span[data-csa-c-content-id]"),
-        (By.CSS_SELECTOR, "div.a-row.a-size-base.a-color-secondary"),
-    ]
-
-    for by, value in selectors:
-        try:
-            elems = block.find_elements(by, value)
-            for elem in elems:
-                txt = clean_text(
-                    elem.get_attribute("data-csa-c-delivery-price") or elem.text
-                )
-                if txt:
-                    texts.append(txt)
-        except Exception:
-            continue
-
-    joined = " | ".join(texts)
-    return infer_shipping_cost(joined), joined
-
-
-def extract_offer_seller(block) -> str:
-    candidates = [
-        (By.CSS_SELECTOR, "#aod-offer-soldBy a"),
-        (By.CSS_SELECTOR, "#aod-offer-soldBy span.a-size-small"),
-        (By.CSS_SELECTOR, "a[role='link']"),
-    ]
-    for by, value in candidates:
-        try:
-            text = clean_text(block.find_element(by, value).text)
-            if text:
-                return text
-        except Exception:
-            continue
+def extract_condition_from_text(block_text: str) -> str:
+    text_low = block_text.lower()
+    if "neuf" in text_low:
+        return "Neuf"
+    if "occasion" in text_low:
+        return "Occasion"
+    if "reconditionné" in text_low:
+        return "Reconditionné"
     return ""
+
+
+def extract_seller_from_text(block_text: str) -> str:
+    """
+    On récupère d'abord après 'Vendeur', sinon après 'Expéditeur',
+    sinon fallback via les liens internes.
+    """
+    patterns = [
+        r"Vendeur\s+([^\n\r]+)",
+        r"Expéditeur\s+([^\n\r]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, block_text, flags=re.IGNORECASE)
+        if m:
+            seller = clean_text(m.group(1))
+            # nettoyage de texte parasite
+            seller = re.sub(r"(Évaluation.*|[0-9]+ ?évaluations.*|[0-9]+ ?% positif.*)$", "", seller, flags=re.IGNORECASE)
+            seller = clean_text(seller)
+            if seller:
+                return seller
+    return ""
+
+
+def extract_shipping_from_text(block_text: str) -> Tuple[Optional[float], str]:
+    shipping_lines = []
+    for line in block_text.split("\n"):
+        line_clean = clean_text(line)
+        if not line_clean:
+            continue
+        low = line_clean.lower()
+        if "livraison" in low or "gratuite" in low or "gratuit" in low:
+            shipping_lines.append(line_clean)
+
+    shipping_text = " | ".join(shipping_lines)
+    shipping_cost = infer_shipping_cost(shipping_text)
+    return shipping_cost, shipping_text
+
+
+def parse_offer_block_text(block_text: str) -> Dict:
+    condition_text = extract_condition_from_text(block_text)
+    seller_name = extract_seller_from_text(block_text)
+    price_item = extract_price_from_text(block_text)
+    shipping_cost, shipping_text = extract_shipping_from_text(block_text)
+
+    return {
+        "offer_condition": condition_text,
+        "seller_name": seller_name,
+        "price_item_eur": price_item,
+        "shipping_eur": shipping_cost,
+        "shipping_text": shipping_text,
+    }
 
 
 def scrape_offer_listing(
@@ -406,216 +291,238 @@ def scrape_offer_listing(
     asin: str,
     product_name: str,
     product_url: str,
-    scrape_ts: str,
-    batch_id: int,
 ) -> List[Dict]:
     offers_url = f"https://www.amazon.fr/gp/offer-listing/{asin}"
-    rows = []
+    rows: List[Dict] = []
 
     driver.get(offers_url)
     time.sleep(6)
+    scroll_page(driver)
 
-    print(f"[DEBUG] Opened offers page: {offers_url}")
-    print(f"[DEBUG] Current URL: {driver.current_url}")
-    print(f"[DEBUG] Page title: {driver.title}")
+    print(f"[DEBUG] URL ouverte : {offers_url}")
+    print(f"[DEBUG] URL finale : {driver.current_url}")
+    print(f"[DEBUG] Titre page : {driver.title}")
 
     page_source_lower = driver.page_source.lower()
-
     if "captcha" in page_source_lower:
-        print("[DEBUG] CAPTCHA detected on offers page")
+        print("[DEBUG] CAPTCHA détecté")
     if "robot" in page_source_lower:
-        print("[DEBUG] Robot check detected on offers page")
-    if "503" in driver.title:
-        print("[DEBUG] Possible temporary Amazon blocking page")
+        print("[DEBUG] Contrôle robot détecté")
 
-    blocks = extract_offer_blocks(driver)
-    print(f"[DEBUG] Total offer blocks found: {len(blocks)}")
+    containers = find_offer_containers(driver)
 
-    rank = 1
-
-    for idx, block in enumerate(blocks, start=1):
+    for i, container in enumerate(containers, start=1):
         try:
-            block_text = clean_text(block.text)
-            print(f"[DEBUG] Block #{idx} preview: {block_text[:300]}")
+            block_text = clean_text(container.text)
+            print(f"[DEBUG] Bloc #{i} aperçu : {block_text[:350]}")
 
-            condition_text = extract_offer_condition(block)
-            print(f"[DEBUG] Block #{idx} condition: {condition_text}")
+            parsed = parse_offer_block_text(block_text)
 
-            if not is_new_offer(condition_text):
-                print(f"[DEBUG] Block #{idx} skipped: not new")
+            condition_text = parsed["offer_condition"]
+            seller_name = parsed["seller_name"]
+            price_item = parsed["price_item_eur"]
+            shipping_cost = parsed["shipping_eur"]
+
+            print(
+                f"[DEBUG] Bloc #{i} -> condition={condition_text} | "
+                f"seller={seller_name} | price={price_item} | shipping={shipping_cost}"
+            )
+
+            if not condition_text or not is_new_offer(condition_text):
                 continue
 
-            seller_name = extract_offer_seller(block)
-            print(f"[DEBUG] Block #{idx} seller: {seller_name}")
-
             if not seller_name:
-                print(f"[DEBUG] Block #{idx} skipped: seller missing")
                 continue
 
             if is_excluded_seller(seller_name):
-                print(f"[DEBUG] Block #{idx} skipped: excluded seller")
                 continue
-
-            price_item = extract_offer_price(block)
-            print(f"[DEBUG] Block #{idx} item price: {price_item}")
 
             if price_item is None:
-                print(f"[DEBUG] Block #{idx} skipped: price missing")
                 continue
 
-            shipping_cost, shipping_text = extract_offer_shipping(block)
-            print(f"[DEBUG] Block #{idx} shipping text: {shipping_text}")
-            print(f"[DEBUG] Block #{idx} shipping cost: {shipping_cost}")
-
-            total_price = price_item + (shipping_cost or 0.0)
+            price_total = price_item + (shipping_cost or 0.0)
 
             rows.append(
                 {
-                    "scrape_timestamp_utc": scrape_ts,
-                    "batch_id": batch_id,
                     "brand": brand,
                     "asin": asin,
                     "product_name": product_name,
                     "product_url": product_url,
                     "offers_url": offers_url,
                     "seller_name": seller_name,
-                    "offer_condition": clean_text(condition_text),
+                    "offer_condition": condition_text,
                     "price_item_eur": price_item,
                     "shipping_eur": shipping_cost if shipping_cost is not None else "",
-                    "price_total_eur": total_price,
-                    "is_free_shipping": 1 if shipping_cost == 0 else 0,
-                    "is_main_offer": 0,
-                    "offer_rank": rank,
+                    "price_total_eur": price_total,
                     "scrape_status": "ok",
                 }
             )
-            rank += 1
 
         except Exception as e:
-            print(f"[DEBUG] Error while parsing block #{idx}: {e}")
+            print(f"[DEBUG] Erreur parsing bloc #{i}: {e}")
             continue
 
-    print(f"[DEBUG] Final valid new offers extracted: {len(rows)}")
-    return rows
-
-
-def deduplicate_rows(rows: List[Dict]) -> List[Dict]:
-    seen = set()
+    # dédoublonnage final
     deduped = []
-
+    seen = set()
     for row in rows:
         key = (
             row["asin"],
             row["seller_name"].strip().lower(),
             row["offer_condition"].strip().lower(),
-            row["price_total_eur"],
         )
         if key in seen:
             continue
         seen.add(key)
         deduped.append(row)
 
+    print(f"[DEBUG] Offres neuves valides extraites : {len(deduped)}")
     return deduped
+
+
+def build_fallback_row(
+    brand: str,
+    asin: str,
+    product_name: str,
+    product_url: str,
+    status: str,
+) -> Dict:
+    return {
+        "brand": brand,
+        "asin": asin,
+        "product_name": product_name,
+        "product_url": product_url,
+        "offers_url": f"https://www.amazon.fr/gp/offer-listing/{asin}" if asin else "",
+        "seller_name": "__NO_SELLER_FOUND__",
+        "offer_condition": "",
+        "price_item_eur": "",
+        "shipping_eur": "",
+        "price_total_eur": "",
+        "scrape_status": status,
+    }
+
+
+def update_tracker_csv(csv_path: str, scraped_rows: List[Dict], scrape_col: str) -> None:
+    """
+    1 ligne par couple produit x vendeur x état
+    1 nouvelle colonne par heure de scraping
+    """
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+        df_existing = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+    else:
+        df_existing = pd.DataFrame(columns=BASE_COLUMNS)
+
+    # garantir colonnes de base
+    for col in BASE_COLUMNS:
+        if col not in df_existing.columns:
+            df_existing[col] = ""
+
+    if scrape_col not in df_existing.columns:
+        df_existing[scrape_col] = ""
+
+    if not scraped_rows:
+        df_existing.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        return
+
+    for row in scraped_rows:
+        key_values = {k: str(row.get(k, "")) for k in TRACKER_KEY_COLUMNS}
+        price_value = row.get("price_total_eur", "")
+        scrape_status = row.get("scrape_status", "")
+        last_seen_utc = now_utc_str()
+
+        mask = pd.Series([True] * len(df_existing))
+        for key_col in TRACKER_KEY_COLUMNS:
+            mask = mask & (df_existing[key_col].fillna("").astype(str) == key_values[key_col])
+
+        if mask.any():
+            idx = df_existing[mask].index[0]
+            df_existing.at[idx, scrape_col] = price_value
+            df_existing.at[idx, "last_seen_utc"] = last_seen_utc
+            df_existing.at[idx, "last_scrape_status"] = scrape_status
+        else:
+            new_row = {col: "" for col in df_existing.columns}
+            for key_col in TRACKER_KEY_COLUMNS:
+                new_row[key_col] = key_values[key_col]
+            new_row["last_seen_utc"] = last_seen_utc
+            new_row["last_scrape_status"] = scrape_status
+            new_row[scrape_col] = price_value
+            df_existing = pd.concat([df_existing, pd.DataFrame([new_row])], ignore_index=True)
+
+    # ordre des colonnes : base d'abord puis colonnes horaires triées
+    fixed_cols = [c for c in BASE_COLUMNS if c in df_existing.columns]
+    time_cols = [
+        c for c in df_existing.columns
+        if c not in fixed_cols
+    ]
+    time_cols_sorted = sorted(
+        time_cols,
+        key=lambda x: (0, x) if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:00$", x) else (1, x)
+    )
+
+    df_existing = df_existing[fixed_cols + time_cols_sorted]
+    df_existing.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
 
 def scrape_product(
     driver: webdriver.Chrome,
     brand: str,
     product: Dict,
-    batch_id: int,
 ) -> List[Dict]:
     product_url = product["product_url"]
     asin = product.get("asin") or extract_asin_from_url(product_url)
     product_name = product.get("product_name", "")
-    scrape_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     if not asin:
         return [
-            {
-                "scrape_timestamp_utc": scrape_ts,
-                "batch_id": batch_id,
-                "brand": brand,
-                "asin": "",
-                "product_name": product_name,
-                "product_url": product_url,
-                "offers_url": "",
-                "seller_name": "",
-                "offer_condition": "",
-                "price_item_eur": "",
-                "shipping_eur": "",
-                "price_total_eur": "",
-                "is_free_shipping": "",
-                "is_main_offer": "",
-                "offer_rank": "",
-                "scrape_status": "error_asin_missing",
-            }
+            build_fallback_row(
+                brand=brand,
+                asin="",
+                product_name=product_name,
+                product_url=product_url,
+                status="error_asin_missing",
+            )
         ]
 
-    all_rows = []
-
     try:
-        main_rows = scrape_main_offer(
+        rows = scrape_offer_listing(
             driver=driver,
             brand=brand,
             asin=asin,
             product_name=product_name,
             product_url=product_url,
-            scrape_ts=scrape_ts,
-            batch_id=batch_id,
         )
-        all_rows.extend(main_rows)
-    except Exception:
-        pass
+        if rows:
+            return rows
 
-    try:
-        listing_rows = scrape_offer_listing(
-            driver=driver,
-            brand=brand,
-            asin=asin,
-            product_name=product_name,
-            product_url=product_url,
-            scrape_ts=scrape_ts,
-            batch_id=batch_id,
-        )
-        all_rows.extend(listing_rows)
-    except Exception:
-        pass
-
-    all_rows = deduplicate_rows(all_rows)
-
-    if not all_rows:
         return [
-            {
-                "scrape_timestamp_utc": scrape_ts,
-                "batch_id": batch_id,
-                "brand": brand,
-                "asin": asin,
-                "product_name": product_name,
-                "product_url": product_url,
-                "offers_url": f"https://www.amazon.fr/gp/offer-listing/{asin}",
-                "seller_name": "",
-                "offer_condition": "",
-                "price_item_eur": "",
-                "shipping_eur": "",
-                "price_total_eur": "",
-                "is_free_shipping": "",
-                "is_main_offer": "",
-                "offer_rank": "",
-                "scrape_status": "no_new_offers_found",
-            }
+            build_fallback_row(
+                brand=brand,
+                asin=asin,
+                product_name=product_name,
+                product_url=product_url,
+                status="no_new_offers_found",
+            )
         ]
 
-    return all_rows
+    except Exception as e:
+        print(f"[DEBUG] Erreur scrape produit {asin}: {e}")
+        return [
+            build_fallback_row(
+                brand=brand,
+                asin=asin,
+                product_name=product_name,
+                product_url=product_url,
+                status=f"error: {str(e)}",
+            )
+        ]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to config JSON")
-    parser.add_argument(
-        "--headful",
-        action="store_true",
-        help="Launch browser with UI instead of headless mode",
-    )
+    parser.add_argument("--headful", action="store_true", help="Run with visible browser")
     args = parser.parse_args()
 
     config = load_json(args.config)
@@ -625,42 +532,40 @@ def main() -> None:
     products = config["products"]
 
     state = load_state(state_file)
-    batch_id = int(state.get("last_batch_id", -1)) + 1
+    scrape_col = current_scrape_column_name()
 
     driver = build_driver(headless=not args.headful)
 
     try:
         driver.get("https://www.amazon.fr")
+        time.sleep(3)
         accept_or_reject_cookies(driver)
 
-        all_rows = []
+        all_rows: List[Dict] = []
 
         for product in products:
             rows = scrape_product(
                 driver=driver,
                 brand=brand,
                 product=product,
-                batch_id=batch_id,
             )
             all_rows.extend(rows)
             time.sleep(2)
 
-        append_rows_to_csv(output_csv, all_rows)
+        update_tracker_csv(output_csv, all_rows, scrape_col)
 
         new_state = {
-            "last_batch_id": batch_id,
-            "last_run_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "last_run_utc": now_utc_str(),
             "last_status": "ok",
             "run_count": int(state.get("run_count", 0)) + 1,
         }
         save_json(state_file, new_state)
 
-        print(f"[OK] {len(all_rows)} lignes ajoutées dans {output_csv}")
+        print(f"[OK] {len(all_rows)} lignes traitées dans {output_csv}")
 
     except Exception as e:
         error_state = {
-            "last_batch_id": state.get("last_batch_id", -1),
-            "last_run_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "last_run_utc": now_utc_str(),
             "last_status": f"error: {str(e)}",
             "run_count": int(state.get("run_count", 0)) + 1,
         }
