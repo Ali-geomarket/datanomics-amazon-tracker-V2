@@ -1,0 +1,12 @@
+{
+  "brand": "Huawei",
+  "output_csv": "datanomics/outputs/amazon_offers.csv",
+  "state_file": "datanomics/state/huawei_state.json",
+  "products": [
+    {
+      "asin": "B07R1Y57YF",
+      "product_name": "Huawei P30 Lite",
+      "product_url": "https://www.amazon.fr/dp/B07R1Y57YF"
+    }
+  ]
+}
