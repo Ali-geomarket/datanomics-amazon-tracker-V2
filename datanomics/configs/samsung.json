@@ -1,0 +1,12 @@
+{
+  "brand": "Samsung",
+  "output_csv": "datanomics/outputs/amazon_offers.csv",
+  "state_file": "datanomics/state/samsung_state.json",
+  "products": [
+    {
+      "asin": "B0F2H1Y4D5",
+      "product_name": "Samsung Galaxy A36",
+      "product_url": "https://www.amazon.fr/dp/B0F2H1Y4D5"
+    }
+  ]
+}
