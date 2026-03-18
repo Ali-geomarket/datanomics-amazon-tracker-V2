@@ -41,12 +41,9 @@ def save_json(path: str, data: Dict) -> None:
 
 def load_state(path: str) -> Dict:
     if os.path.exists(path):
-        return load_json(path)
-    return {
-        "last_run_utc": None,
-        "last_status": None,
-        "run_count": 0,
-    }
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"last_run_utc": None, "last_status": None, "run_count": 0}
 
 
 def build_driver(headless: bool = True) -> webdriver.Chrome:
@@ -140,10 +137,6 @@ def infer_shipping_cost_from_text(text: str) -> Optional[float]:
     if m:
         return parse_price_to_float(m.group(1))
 
-    m2 = re.search(r"(\d+[.,]\d+)\s*€", txt)
-    if m2:
-        return parse_price_to_float(m2.group(1))
-
     return None
 
 
@@ -152,96 +145,42 @@ def get_offer_page_url(asin: str) -> str:
 
 
 def scroll_page(driver: webdriver.Chrome) -> None:
-    for y in [300, 800, 1400, 2200, 0]:
+    for y in [300, 900, 1500, 2200, 3000, 0]:
         driver.execute_script(f"window.scrollTo(0, {y});")
         time.sleep(1.2)
 
 
-def find_row_divs(soup: BeautifulSoup):
-    rows = soup.select("div[id^='newAccordionRow_']")
-    return rows
+def save_debug_files(asin: str, html: str, screenshot_ok: bool, current_url: str, title: str) -> None:
+    os.makedirs("datanomics/debug", exist_ok=True)
+
+    html_path = f"datanomics/debug/{asin}_offers.html"
+    meta_path = f"datanomics/debug/{asin}_meta.txt"
+
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    with open(meta_path, "w", encoding="utf-8") as f:
+        f.write(f"ASIN: {asin}\n")
+        f.write(f"Final URL: {current_url}\n")
+        f.write(f"Title: {title}\n")
+        f.write(f"Screenshot saved: {screenshot_ok}\n")
 
 
-def extract_condition_from_row(row) -> str:
-    candidates = []
-
-    caption = row.select_one("#newAccordionCaption_feature_div")
-    if caption:
-        candidates.append(clean_text(caption.get_text(" ", strip=True)))
-
-    bolds = row.select("span.a-text-bold")
-    for b in bolds:
-        candidates.append(clean_text(b.get_text(" ", strip=True)))
-
-    all_text = " | ".join(candidates).lower()
-    if "neuf" in all_text:
+def extract_condition_from_row_text(text: str) -> str:
+    low = text.lower()
+    if "neuf" in low:
         return "Neuf"
-    if "occasion" in all_text:
+    if "occasion" in low:
         return "Occasion"
-    if "reconditionné" in all_text:
+    if "reconditionné" in low:
         return "Reconditionné"
-
-    full = clean_text(row.get_text(" ", strip=True)).lower()
-    if "neuf" in full:
-        return "Neuf"
-    if "occasion" in full:
-        return "Occasion"
-    if "reconditionné" in full:
-        return "Reconditionné"
-
     return ""
 
 
-def extract_price_from_row(row) -> Optional[float]:
-    selectors = [
-        "span.a-price span.a-offscreen",
-        "#corePrice_feature_div span.a-offscreen",
-        ".apex-pricetopay-value span.a-offscreen",
-    ]
-
-    for sel in selectors:
-        el = row.select_one(sel)
-        if el:
-            p = parse_price_to_float(el.get_text(" ", strip=True))
-            if p is not None:
-                return p
-
-    text = clean_text(row.get_text(" ", strip=True))
-    matches = re.findall(r"(\d[\d\s.,]{0,12})\s*€", text)
-    for raw in matches:
-        p = parse_price_to_float(raw)
-        if p is not None and p > 0:
-            return p
-
-    return None
-
-
-def extract_seller_from_row(row) -> str:
-    # cas le plus fiable : lien vendeur dans merchantInfoFeature
-    seller_link = row.select_one(
-        "#merchantInfoFeature_feature_div a#sellerProfileTriggerId, "
-        "div[id='merchantInfoFeature_feature_div'] a#sellerProfileTriggerId"
-    )
-    if seller_link:
-        txt = clean_text(seller_link.get_text(" ", strip=True))
-        if txt:
-            return txt
-
-    # fallback : texte direct dans merchantInfoFeature
-    seller_msg = row.select_one(
-        "#merchantInfoFeature_feature_div .offer-display-feature-text-message, "
-        "div[id='merchantInfoFeature_feature_div'] .offer-display-feature-text-message"
-    )
-    if seller_msg:
-        txt = clean_text(seller_msg.get_text(" ", strip=True))
-        if txt:
-            return txt
-
-    # fallback brut à partir du texte de la row
-    text = clean_text(row.get_text("\n", strip=True))
+def extract_seller_from_row_text(text: str) -> str:
     patterns = [
-        r"Vendu par\s+([^\n]+)",
-        r"Vendeur\s+([^\n]+)",
+        r"Vendu par\s+([^\n\r]+)",
+        r"Vendeur\s+([^\n\r]+)",
     ]
     for pattern in patterns:
         m = re.search(pattern, text, flags=re.IGNORECASE)
@@ -251,86 +190,75 @@ def extract_seller_from_row(row) -> str:
             seller = clean_text(seller)
             if seller:
                 return seller
-
     return ""
 
 
-def extract_shipping_cost_from_row(row) -> Optional[float]:
-    selectors = [
-        "#primeBadgeAndShippingMessageAbbreviated_feature_div",
-        "#deliveryBlockMessage",
-        "[data-csa-c-delivery-price]",
-    ]
-
-    texts = []
-
-    for sel in selectors:
-        for el in row.select(sel):
-            attr = clean_text(el.get("data-csa-c-delivery-price", ""))
-            txt = clean_text(el.get_text(" ", strip=True))
-            if attr:
-                texts.append(attr)
-            if txt:
-                texts.append(txt)
-
-    row_text = clean_text(row.get_text(" ", strip=True))
-    if "livraison" in row_text.lower():
-        texts.append(row_text)
-
-    merged = " | ".join([t for t in texts if t])
-    return infer_shipping_cost_from_text(merged)
+def extract_price_from_row_text(text: str) -> Optional[float]:
+    matches = re.findall(r"(\d[\d\s.,]{0,12})\s*€", text)
+    for raw in matches:
+        p = parse_price_to_float(raw)
+        if p is not None and p > 0:
+            return p
+    return None
 
 
 def parse_offer_rows_from_html(html: str, brand: str, asin: str, product_name: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
-    rows = find_row_divs(soup)
 
-    print(f"[DEBUG] {asin} - accordion rows found: {len(rows)}")
+    selectors = [
+        "div[id^='newAccordionRow_']",
+        "div[id*='accordionRow']",
+        "div.a-box-group",
+        "div.a-section",
+    ]
+
+    row_nodes = []
+    for sel in selectors:
+        found = soup.select(sel)
+        if found:
+            print(f"[DEBUG] {asin} selector {sel} -> {len(found)} nodes")
+            row_nodes = found
+            break
 
     parsed_rows: List[Dict] = []
 
-    for i, row in enumerate(rows, start=1):
-        try:
-            condition = extract_condition_from_row(row)
-            seller = extract_seller_from_row(row)
-            price_item = extract_price_from_row(row)
-            shipping = extract_shipping_cost_from_row(row)
-
-            print(
-                f"[DEBUG] {asin} row #{i} | condition={condition} | "
-                f"seller={seller} | price_item={price_item} | shipping={shipping}"
-            )
-
-            if not condition or not is_new_offer(condition):
-                continue
-
-            if not seller:
-                continue
-
-            if is_excluded_seller(seller):
-                continue
-
-            if price_item is None:
-                continue
-
-            total = price_item + (shipping or 0.0)
-
-            parsed_rows.append(
-                {
-                    "brand": brand,
-                    "asin": asin,
-                    "product_name": product_name,
-                    "seller_name": seller,
-                    "offer_condition": condition,
-                    "price_total_eur": round(total, 2),
-                }
-            )
-
-        except Exception as e:
-            print(f"[DEBUG] {asin} row #{i} parse error: {e}")
+    for i, row in enumerate(row_nodes, start=1):
+        row_text = clean_text(row.get_text("\n", strip=True))
+        if not row_text:
             continue
 
-    # dédoublonnage final par clé métier
+        condition = extract_condition_from_row_text(row_text)
+        seller = extract_seller_from_row_text(row_text)
+        price_item = extract_price_from_row_text(row_text)
+        shipping = infer_shipping_cost_from_text(row_text)
+
+        print(
+            f"[DEBUG] {asin} row #{i} | condition={condition} | "
+            f"seller={seller} | price_item={price_item} | shipping={shipping}"
+        )
+
+        if not condition or not is_new_offer(condition):
+            continue
+        if not seller:
+            continue
+        if is_excluded_seller(seller):
+            continue
+        if price_item is None:
+            continue
+
+        total = price_item + (shipping or 0.0)
+
+        parsed_rows.append(
+            {
+                "brand": brand,
+                "asin": asin,
+                "product_name": product_name,
+                "seller_name": seller,
+                "offer_condition": condition,
+                "price_total_eur": round(total, 2),
+            }
+        )
+
     deduped = []
     seen = set()
     for row in parsed_rows:
@@ -346,7 +274,7 @@ def parse_offer_rows_from_html(html: str, brand: str, asin: str, product_name: s
         seen.add(key)
         deduped.append(row)
 
-    print(f"[DEBUG] {asin} - valid new seller rows: {len(deduped)}")
+    print(f"[DEBUG] {asin} valid rows: {len(deduped)}")
     return deduped
 
 
@@ -356,32 +284,39 @@ def scrape_product(driver: webdriver.Chrome, brand: str, product: Dict) -> List[
     product_name = product.get("product_name", "")
 
     if not asin:
-        print(f"[DEBUG] ASIN missing for {product_url}")
+        print(f"[DEBUG] Missing ASIN for {product_url}")
         return []
 
     offer_url = get_offer_page_url(asin)
-    print(f"[DEBUG] Opening offer page: {offer_url}")
+    print(f"[DEBUG] Opening {offer_url}")
 
     driver.get(offer_url)
-    time.sleep(6)
+    time.sleep(7)
     scroll_page(driver)
 
     html = driver.page_source
-    page_lower = html.lower()
+    title = driver.title
+    current_url = driver.current_url
 
-    print(f"[DEBUG] Final URL for {asin}: {driver.current_url}")
-    print(f"[DEBUG] Title for {asin}: {driver.title}")
+    screenshot_path = f"datanomics/debug/{asin}_offers.png"
+    os.makedirs("datanomics/debug", exist_ok=True)
+    screenshot_ok = driver.save_screenshot(screenshot_path)
 
-    if "captcha" in page_lower:
+    save_debug_files(
+        asin=asin,
+        html=html,
+        screenshot_ok=screenshot_ok,
+        current_url=current_url,
+        title=title,
+    )
+
+    lower = html.lower()
+    if "captcha" in lower:
         print(f"[DEBUG] CAPTCHA detected for {asin}")
         return []
-
-    if "robot" in page_lower:
+    if "robot" in lower:
         print(f"[DEBUG] Robot check detected for {asin}")
         return []
-
-    if "newAccordionRow_" not in html:
-        print(f"[DEBUG] No newAccordionRow_ found in page source for {asin}")
 
     return parse_offer_rows_from_html(
         html=html,
@@ -399,7 +334,6 @@ def update_tracker_csv(csv_path: str, scraped_rows: List[Dict], scrape_col: str)
     else:
         df = pd.DataFrame(columns=KEY_COLUMNS)
 
-    # garder uniquement les colonnes voulues + colonnes horaires
     for col in KEY_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -407,7 +341,6 @@ def update_tracker_csv(csv_path: str, scraped_rows: List[Dict], scrape_col: str)
     if scrape_col not in df.columns:
         df[scrape_col] = ""
 
-    # supprimer colonnes indésirables héritées des essais précédents
     allowed = set(KEY_COLUMNS + [c for c in df.columns if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:00$", str(c))])
     df = df[[c for c in df.columns if c in allowed]]
 
@@ -440,7 +373,7 @@ def update_tracker_csv(csv_path: str, scraped_rows: List[Dict], scrape_col: str)
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to config JSON")
-    parser.add_argument("--headful", action="store_true", help="Run with visible browser")
+    parser.add_argument("--headful", action="store_true")
     args = parser.parse_args()
 
     config = load_json(args.config)
@@ -460,7 +393,6 @@ def main() -> None:
         accept_or_reject_cookies(driver)
 
         all_rows: List[Dict] = []
-
         for product in products:
             rows = scrape_product(driver=driver, brand=brand, product=product)
             all_rows.extend(rows)
@@ -475,7 +407,7 @@ def main() -> None:
         }
         save_json(state_file, new_state)
 
-        print(f"[OK] {len(all_rows)} seller rows written to tracker {output_csv}")
+        print(f"[OK] {len(all_rows)} rows written")
 
     except Exception as e:
         error_state = {
