@@ -294,35 +294,52 @@ def scrape_main_offer(
 
 
 def extract_offer_blocks(driver: webdriver.Chrome):
+    time.sleep(3)
+
+    # petit scroll pour forcer le rendu complet
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.35);")
+    time.sleep(2)
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.65);")
+    time.sleep(2)
+    driver.execute_script("window.scrollTo(0, 0);")
+    time.sleep(1)
+
     selectors = [
-        "div#aod-offer",
         "div[id^='aod-offer-']",
         "div.aod-information-block",
         "div.a-section.a-spacing-none.a-padding-base",
+        "div[data-cy='offer']",
+        "div.olpOffer",
     ]
 
     for css in selectors:
         blocks = driver.find_elements(By.CSS_SELECTOR, css)
         if blocks:
+            print(f"[DEBUG] selector '{css}' -> {len(blocks)} blocks found")
             return blocks
+
+    print("[DEBUG] No offer blocks found with known selectors")
     return []
 
 
 def extract_offer_condition(block) -> str:
     candidates = [
-        (By.CSS_SELECTOR, "div#aod-offer-heading h5"),
         (By.CSS_SELECTOR, "div#aod-offer-heading"),
+        (By.CSS_SELECTOR, "div[id*='aod-offer-heading']"),
         (By.CSS_SELECTOR, "h5"),
+        (By.CSS_SELECTOR, "span"),
     ]
+
     for by, value in candidates:
         try:
-            text = clean_text(block.find_element(by, value).text)
-            if text:
-                return text
+            elems = block.find_elements(by, value)
+            for elem in elems:
+                text = clean_text(elem.text)
+                if text and ("neuf" in text.lower() or "occasion" in text.lower() or "reconditionné" in text.lower()):
+                    return text
         except Exception:
             continue
     return ""
-
 
 def extract_offer_price(block) -> Optional[float]:
     candidates = [
@@ -396,29 +413,60 @@ def scrape_offer_listing(
     rows = []
 
     driver.get(offers_url)
-    time.sleep(4)
+    time.sleep(6)
+
+    print(f"[DEBUG] Opened offers page: {offers_url}")
+    print(f"[DEBUG] Current URL: {driver.current_url}")
+    print(f"[DEBUG] Page title: {driver.title}")
+
+    page_source_lower = driver.page_source.lower()
+
+    if "captcha" in page_source_lower:
+        print("[DEBUG] CAPTCHA detected on offers page")
+    if "robot" in page_source_lower:
+        print("[DEBUG] Robot check detected on offers page")
+    if "503" in driver.title:
+        print("[DEBUG] Possible temporary Amazon blocking page")
 
     blocks = extract_offer_blocks(driver)
+    print(f"[DEBUG] Total offer blocks found: {len(blocks)}")
+
     rank = 1
 
-    for block in blocks:
+    for idx, block in enumerate(blocks, start=1):
         try:
+            block_text = clean_text(block.text)
+            print(f"[DEBUG] Block #{idx} preview: {block_text[:300]}")
+
             condition_text = extract_offer_condition(block)
+            print(f"[DEBUG] Block #{idx} condition: {condition_text}")
+
             if not is_new_offer(condition_text):
+                print(f"[DEBUG] Block #{idx} skipped: not new")
                 continue
 
             seller_name = extract_offer_seller(block)
+            print(f"[DEBUG] Block #{idx} seller: {seller_name}")
+
             if not seller_name:
+                print(f"[DEBUG] Block #{idx} skipped: seller missing")
                 continue
 
             if is_excluded_seller(seller_name):
+                print(f"[DEBUG] Block #{idx} skipped: excluded seller")
                 continue
 
             price_item = extract_offer_price(block)
+            print(f"[DEBUG] Block #{idx} item price: {price_item}")
+
             if price_item is None:
+                print(f"[DEBUG] Block #{idx} skipped: price missing")
                 continue
 
-            shipping_cost, _shipping_text = extract_offer_shipping(block)
+            shipping_cost, shipping_text = extract_offer_shipping(block)
+            print(f"[DEBUG] Block #{idx} shipping text: {shipping_text}")
+            print(f"[DEBUG] Block #{idx} shipping cost: {shipping_cost}")
+
             total_price = price_item + (shipping_cost or 0.0)
 
             rows.append(
@@ -443,9 +491,11 @@ def scrape_offer_listing(
             )
             rank += 1
 
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG] Error while parsing block #{idx}: {e}")
             continue
 
+    print(f"[DEBUG] Final valid new offers extracted: {len(rows)}")
     return rows
 
 
