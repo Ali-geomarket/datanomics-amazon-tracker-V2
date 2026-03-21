@@ -1,4 +1,4 @@
 ASIN: B0DGHY5KG8
-Final URL: https://www.amazon.fr/dp/B0DGHY5KG8/ref=olp-opf-redir?aod=1
-Title: Amazon.fr
+Final URL: https://www.amazon.fr/dp/B0DGHY5KG8/ref=olp-opf-redir?aod=1&th=1
+Title: Apple iphone 16 (128gb) - black : Amazon.fr: Electronics
 Screenshot saved: True
