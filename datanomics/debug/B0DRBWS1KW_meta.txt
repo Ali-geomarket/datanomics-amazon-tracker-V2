@@ -1,4 +1,4 @@
 ASIN: B0DRBWS1KW
-Final URL: https://www.amazon.fr/dp/B0DRBWS1KW/ref=olp-opf-redir?aod=1&th=1
-Title: XIAOMI Redmi Note 14 Pro+ 5G Smartphone, 8+256GB, Black, 200MP Pro-Grade AI Camera, IP68, 120W HyperCharge, AI Features (No Charger Included) : Amazon.fr: Health & Household
+Final URL: https://www.amazon.fr/dp/B0DRBWS1KW/ref=olp-opf-redir?aod=1
+Title: Amazon.fr
 Screenshot saved: True
